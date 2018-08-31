@@ -15,10 +15,36 @@
  */
 
 #include "mbed.h"
-#include "TCPSocket.h"
+#include "mbed_events.h"
+#include "UDPSocket.h"
+#include "platform/CircularBuffer.h"
 
 #define WIFI_ESP8266    1
 #define WIFI_IDW0XX1    2
+
+#define BUFFER_SIZE 536
+
+//Thread recv_thread;
+Thread send_thread;
+Thread toggle_thread;
+EventQueue queue(8 * EVENTS_EVENT_SIZE);
+InterruptIn sw(D3);
+Serial pc(USBTX, USBRX);
+//InterruptIn ld(SW1);
+Thread spi_thread;
+DigitalOut led(LED_BLUE);
+UDPSocket udpsocket;
+SocketAddress remote_address;
+SPISlave spi(SPI_MOSI, SPI_MISO, SPI_SCK, SPI_CS);
+
+Mutex stdio_send;
+Timer t;
+volatile bool _isError = false;
+int dt=0, n=0;
+// Allocate 1K of data
+uint16_t *in_buffer =  new uint16_t[BUFFER_SIZE/2];
+char *out_buffer = new char[BUFFER_SIZE];
+CircularBuffer<uint16_t, BUFFER_SIZE> buf;
 
 #if TARGET_UBLOX_EVK_ODIN_W2
 #include "OdinWiFiInterface.h"
@@ -59,97 +85,138 @@ const char *sec2str(nsapi_security_t sec)
     }
 }
 
-int scan_demo(WiFiInterface *wifi)
-{
-    WiFiAccessPoint *ap;
+/*
+void receiveUDP() {
 
-    printf("Scan:\n");
+    while(!_isError) {
+        // recvfrom blocks until there is data
+        nsapi_size_or_error_t size = udpsocket.recvfrom(&remote_address, in_buffer, BUFFER_SIZE);
+        if (size <= 0) {
+            if (size == NSAPI_ERROR_WOULD_BLOCK) {  // Would block... that's fine (no data on the line)
+                wait_us(1);
+                continue;
+            }
 
-    int count = wifi->scan(NULL,0);
-
-    /* Limit number of network arbitrary to 15 */
-    count = count < 15 ? count : 15;
-
-    ap = new WiFiAccessPoint[count];
-    count = wifi->scan(ap, count);
-    for (int i = 0; i < count; i++)
-    {
-        printf("Network: %s secured: %s BSSID: %hhX:%hhX:%hhX:%hhx:%hhx:%hhx RSSI: %hhd Ch: %hhd\n", ap[i].get_ssid(),
-               sec2str(ap[i].get_security()), ap[i].get_bssid()[0], ap[i].get_bssid()[1], ap[i].get_bssid()[2],
-               ap[i].get_bssid()[3], ap[i].get_bssid()[4], ap[i].get_bssid()[5], ap[i].get_rssi(), ap[i].get_channel());
+            printf("Error while receiving data from TCP socket, probably it's closed now? (%d)\n", size);
+            _isError = true;
+            break;
+        }
+        // turn into valid C string
+        printf("Received size: %d\n",size);
     }
-    printf("%d networks available.\n", count);
+}
+*/
 
-    delete[] ap;
-    return count;
+
+void sendUDP() {
+	/*Timer*/
+	int dt = t.read_ms();
+	out_buffer[4] = (char)	(dt >> 24);
+	out_buffer[5] = (char)	(dt >> 16);
+	out_buffer[6] = (char)	(dt >> 8);
+	out_buffer[7] = (char)	dt;
+
+	if(buf.full()){
+		uint16_t data=0;
+		/*Synchronizing the buffer data*/
+		while(data!=0xAA0A){
+			buf.pop(data);
+			if(buf.empty()) return;
+		}
+		out_buffer[8]	=(char) (data>>8);
+		out_buffer[9]	=(char)	data;
+		for(int i=5;i<BUFFER_SIZE/2-4;i++){
+			buf.pop(data);
+			if(buf.empty()) return;
+			out_buffer[2*i]		=(char) (data>>8);
+			out_buffer[2*i+1]	=(char)	data;
+		}
+		buf.reset();
+		nsapi_size_or_error_t size = udpsocket.sendto(remote_address, out_buffer, BUFFER_SIZE);
+//		printf("Sent; First Data %X, Last Data %X\n", out_buffer[0], out_buffer[BUFFER_SIZE-1]);
+		wait_ms(1);
+		if (size <= 0) {
+			if (size == NSAPI_ERROR_WOULD_BLOCK) {  // Would block... that's fine (no data on the line)
+				wait_us(1);
+				return;
+		}
+			printf("Error while sending data from TCP socket, probably it's closed now? (%d)\n", size);
+			_isError = true;
+			return;
+		}
+		buf.reset();
+	}
+	else {
+		return;
+	}
+//	t.stop();
+	//printf("Time:%d\tSent Size: %d\n", t.read_ms()-dt, size);
+//	dt = t.read_ms();
+//	t.start();
 }
 
-void http_demo(NetworkInterface *net)
-{
-    TCPSocket socket;
-    nsapi_error_t response;
+void spi_read(){
+	if(!buf.full()){
+		buf.push((uint16_t) spi.read());
+	}
+}
 
-    printf("Sending HTTP request to www.arm.com...\n");
+void closeTCP(nsapi_size_or_error_t s, nsapi_error_t err){
+    printf("Closing the socket and Wifi Connection %d | %d\n", s, err);
+    udpsocket.close();
+    wifi.disconnect();
+}
 
-    // Open a socket on the network interface, and create a TCP connection to www.arm.com
-    socket.open(net);
-    response = socket.connect("www.arm.com", 80);
-    if(0 != response) {
-        printf("Error connecting: %d\n", response);
-        socket.close();
-        return;
-    }
 
-    // Send a simple http request
-    char sbuffer[] = "GET / HTTP/1.1\r\nHost: www.arm.com\r\n\r\n";
-    nsapi_size_t size = strlen(sbuffer);
-    response = 0;
-    while(size)
-    {
-        response = socket.send(sbuffer+response, size);
-        if (response < 0) {
-            printf("Error sending data: %d\n", response);
-            socket.close();
-            return;
-        } else {
-            size -= response;
-            // Check if entire message was sent or not
-            printf("sent %d [%.*s]\n", response, strstr(sbuffer, "\r\n")-sbuffer, sbuffer);
-        }
-    }
-
-    // Recieve a simple http response and print out the response line
-    char rbuffer[64];
-    response = socket.recv(rbuffer, sizeof rbuffer);
-    if (response < 0) {
-        printf("Error receiving data: %d\n", response);
-    } else {
-        printf("recv %d [%.*s]\n", response, strstr(rbuffer, "\r\n")-rbuffer, rbuffer);
-    }
-
-    // Close the socket to return its memory and bring down the network interface
-    socket.close();
+void led_toggle(){
+	uint16_t data;
+	printf("led toggle runs\n");
+	if(pc.getc()=='y'){
+		led = !led;
+		printf("%d\n", n);
+		for(int j=n-10;j<n;j++){
+			printf("%X\n", in_buffer[j]);
+		}
+		send_thread.signal_set(0x01);
+		return;
+	}
+	else if(pc.getc()=='x'){
+		led = !led;
+		printf("%d\n", n);
+		for(int j=0;j<n;j++){
+			printf("%X\n", in_buffer[j]);
+		}
+		printf("Buffer Content: ");
+		bool ret = true;
+		while(!buf.empty() && ret){
+			ret = buf.pop(data);
+			printf("%X ", data);
+		}
+		send_thread.signal_set(0x01);
+		return;
+	}
+	else {
+		send_thread.signal_set(0x01);
+		return;
+	}
 }
 
 int main()
 {
-    int count = 0;
-
-    printf("WiFi example\n\n");
-
-    count = scan_demo(&wifi);
-    if (count == 0) {
-        printf("No WIFI APNs found - can't continue further.\n");
-        return -1;
-    }
-
+//	EventQueue *queue = mbed_event_queue();
+    spi.format(16,0);
+    spi.frequency(5000000);
+//   int count = 0;
+    printf("UDP Client\n\n");
+//    wait_ms(1000);
     printf("\nConnecting to %s...\n", MBED_CONF_APP_WIFI_SSID);
     int ret = wifi.connect(MBED_CONF_APP_WIFI_SSID, MBED_CONF_APP_WIFI_PASSWORD, NSAPI_SECURITY_WPA_WPA2);
     if (ret != 0) {
         printf("\nConnection error\n");
+        wifi.disconnect();
         return -1;
     }
-
+    wait(1);
     printf("Success\n\n");
     printf("MAC: %s\n", wifi.get_mac_address());
     printf("IP: %s\n", wifi.get_ip_address());
@@ -157,9 +224,45 @@ int main()
     printf("Gateway: %s\n", wifi.get_gateway());
     printf("RSSI: %d\n\n", wifi.get_rssi());
 
-    http_demo(&wifi);
+    nsapi_error_t response;
+    /*Open the server on wifi stack*/
+    response = udpsocket.open(&wifi);
+    if(response != NSAPI_ERROR_OK){
+    	printf("error initialized port %d\n", response);
+    	wifi.disconnect();
+    	return -1;
+    }
 
-    wifi.disconnect();
+    udpsocket.set_blocking(false);
+    if(!remote_address.set_ip_address("192.168.2.220")){
+    	printf("error setting remote ip address\n");
+    	wifi.disconnect();
+    	return -2;
+    }
+    remote_address.set_port(5555);
+    wait_ms(100);
 
-    printf("\nDone\n");
+/******************** Data Framing ********************/
+	/*Start Sync Bytes*/
+	out_buffer[0]=0x0A;
+	out_buffer[1]=0x05;
+	out_buffer[2]=0x0A;
+	out_buffer[3]=0x05;
+	/*Stop Sync Bytes*/
+	out_buffer[BUFFER_SIZE-1]=0xAA;
+	out_buffer[BUFFER_SIZE-2]=0x55;
+	out_buffer[BUFFER_SIZE-3]=0xAA;
+	out_buffer[BUFFER_SIZE-4]=0x55;
+
+
+/************** ISR and Queue Initialize **************/
+
+    send_thread.start(callback(sendUDP));
+	sw.mode(PullDown);
+	sw.fall(&spi_read);
+//    sw.rise(queue.event(sendUDP));
+    queue.call_every(1, sendUDP);
+    t.start();
+	queue.dispatch_forever();
+    wait(osWaitForever);
 }

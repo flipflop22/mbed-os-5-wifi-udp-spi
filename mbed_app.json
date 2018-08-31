@@ -6,11 +6,11 @@
 	},
         "wifi-ssid": {
             "help": "WiFi SSID",
-            "value": "\"SSID\""
+            "value": "\"RollsRoyce\""
         },
         "wifi-password": {
             "help": "WiFi Password",
-            "value": "\"PASSWORD\""
+            "value": "\"rr epsilon\""
         },
         "wifi-tx": {
             "help": "TX pin for serial connection to external device",
@@ -26,7 +26,8 @@
             "platform.stdio-convert-newlines": true
         },
         "UBLOX_EVK_ODIN_W2": {
-            "target.device_has": ["EMAC"]
+            "target.device_has": ["EMAC"],
+            "lwip.pbuf-pool-bufsize" : 590
         },
         "NUCLEO_L476RG": {
             "wifi-tx": "D8",
